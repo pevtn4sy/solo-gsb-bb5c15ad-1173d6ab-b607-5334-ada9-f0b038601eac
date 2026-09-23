@@ -1,0 +1,29 @@
+services:
+  api:
+    build: .
+    container_name: crossover-api
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite 数据库文件位置（容器内路径，挂卷持久化）
+      DATABASE_PATH: /app/data/experiments.db
+    volumes:
+      - crossover-data:/app/data
+    # 容器启动时：安装依赖 -> 启动服务（应用启动时自动建表）
+    command: >
+      sh -c "pip install --no-cache-dir -r requirements.txt
+      && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  # 回归测试服务：docker compose --profile test run --rm tests
+  # 使用独立的临时数据库（容器内 tmpfs 路径），与 api 服务的数据卷互不影响。
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    environment:
+      DATABASE_PATH: /tmp/regression/experiments.db
+    command: ["pytest", "-q"]
+
+volumes:
+  crossover-data:
