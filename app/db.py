@@ -4,6 +4,9 @@
 ``experiments.db``。表结构在应用启动时通过 :func:`init_db` 创建，
 新增表均使用 ``CREATE TABLE IF NOT EXISTS``，新增列通过幂等的
 ``ALTER TABLE`` 补齐，因此已有数据库在启动时会自动迁移，无需手工介入。
+建表、缺列判断与旧列补齐在同一个 ``BEGIN IMMEDIATE`` 事务内完成，
+检查前即持有写锁：多个 API 进程同时启动迁移同一旧库时串行执行，
+不会重复 ``ALTER`` 同一列；迁移中断整体回滚，不留半迁移结构。
 
 表说明：
 * ``experiments`` / ``assignments``：实验与受试者的完整条件序列，
@@ -547,6 +550,29 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row["name"] == column for row in conn.execute(f"PRAGMA table_info({table})"))
 
 
+def _schema_statements() -> list[str]:
+    """把 :data:`SCHEMA` 拆成独立 SQL 语句，供在显式事务内逐条 ``execute``。
+
+    SCHEMA 中 ``;`` 只用作语句结束符（注释与字符串字面量内均不含分号）。
+    必须逐条执行而不是 ``executescript``：后者会先隐式提交当前事务，
+    无法让建表语句与旧列补齐同处一个 ``BEGIN IMMEDIATE`` 事务。
+    """
+    statements: list[str] = []
+    for chunk in SCHEMA.split(";"):
+        stripped = chunk.strip()
+        if not stripped:
+            continue
+        # 拆出的纯注释 / 空白段不是可执行语句（正常 SCHEMA 中不会出现，
+        # 此处仅做防御）
+        if all(
+            not line.strip() or line.lstrip().startswith("--")
+            for line in stripped.splitlines()
+        ):
+            continue
+        statements.append(stripped)
+    return statements
+
+
 def init_db() -> None:
     """建表 / 迁移（幂等），在应用启动时调用。
 
@@ -557,10 +583,28 @@ def init_db() -> None:
     * 旧库缺少 ``status`` / ``state_version`` 列时分别以
       ``ALTER TABLE ... DEFAULT 'active' / 0`` 补齐，
       旧实验一律按“运行中、版本 0”处理。
+
+    建表、缺列判断与旧列补齐全部在**同一个 ``BEGIN IMMEDIATE`` 事务**内
+    完成，且在任何检查之前即持有库级写锁：
+
+    * 多个 API 进程 / 线程同时启动迁移同一旧库时，后来者在
+      ``BEGIN IMMEDIATE`` 处排队（受 ``busy_timeout`` 保护），等首个
+      事务提交后才在写锁内重新检查列，缺列判断与 ``ALTER TABLE`` 串行
+      执行，不会双双认定缺列而让后执行者因 duplicate column 启动失败；
+    * SQLite 的 DDL 支持事务：迁移中途失败 / 进程中断时整个事务回滚，
+      不会留下只补了一半列的半迁移结构，下次启动重新整体迁移；
+    * 已迁移库重复启动时所有检查均命中“列已存在”，不执行任何
+      DDL / ``ALTER TABLE``，结构保持不变，已有数据与旧库缺省值
+      （``0`` / ``'active'`` / ``0``）原样保留。
     """
-    with closing(get_connection()) as conn:
-        with conn:
-            conn.executescript(SCHEMA)
+    conn = get_connection()
+    try:
+        # 检查前即取库级写锁，把“建表 -> 缺列判断 -> ALTER 补齐”整体串行化
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in _schema_statements():
+                conn.execute(statement)
             if not _column_exists(conn, "experiments", "washout_seconds"):
                 conn.execute(
                     "ALTER TABLE experiments "
@@ -576,6 +620,13 @@ def init_db() -> None:
                     "ALTER TABLE experiments "
                     "ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0"
                 )
+            conn.execute("COMMIT")
+        except BaseException:
+            # 迁移中断（进程被杀时由 SQLite 崩溃恢复自动回滚）不留半迁移结构
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
 
 
 def _commitment_digest(

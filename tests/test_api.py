@@ -2340,6 +2340,173 @@ def test_startup_migrates_legacy_database(tmp_path, monkeypatch) -> None:
         assert second.json()["condition"] == "C"
 
 
+def test_concurrent_init_db_serializes_legacy_migration(
+    tmp_path, monkeypatch
+) -> None:
+    """多个进程 / 线程同时迁移同一旧库：写锁内串行，无人因 duplicate column 失败。"""
+    db_path = tmp_path / "legacy-race.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+
+    # 旧版库：experiments 缺 washout_seconds / status / state_version 三列
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE experiments (
+                id TEXT PRIMARY KEY,
+                conditions TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                group_size INTEGER NOT NULL,
+                num_subjects INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE assignments (
+                experiment_id TEXT NOT NULL REFERENCES experiments(id),
+                subject_id TEXT NOT NULL,
+                sequence_index INTEGER NOT NULL,
+                sequence TEXT NOT NULL,
+                PRIMARY KEY (experiment_id, subject_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO experiments "
+            "(id, conditions, seed, group_size, num_subjects, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy-race", '["A","B"]', 1, 2, 2, "2026-01-01T00:00:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO assignments "
+            "(experiment_id, subject_id, sequence_index, sequence) "
+            "VALUES (?, ?, ?, ?)",
+            ("legacy-race", "s1", 0, '["A","B"]'),
+        )
+
+    # 8 个并发“启动者”同时迁移：BEGIN IMMEDIATE 写锁串行化，全部成功
+    workers = 8
+    barrier = threading.Barrier(workers)
+    errors: list[BaseException] = []
+
+    def _migrate() -> None:
+        try:
+            barrier.wait(timeout=10)
+            db.init_db()
+        except BaseException as exc:  # 测试需要收集全部异常后统一断言
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_migrate) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+
+    assert errors == []
+
+    # 迁移只发生一次：每列恰好一份，旧数据与缺省值保留
+    with sqlite3.connect(db_path) as conn:
+        columns = [
+            row[1] for row in conn.execute("PRAGMA table_info(experiments)")
+        ]
+        assert columns.count("washout_seconds") == 1
+        assert columns.count("status") == 1
+        assert columns.count("state_version") == 1
+        row = conn.execute(
+            "SELECT washout_seconds, status, state_version "
+            "FROM experiments WHERE id = 'legacy-race'"
+        ).fetchone()
+        assert tuple(row) == (0, "active", 0)
+        assert conn.execute(
+            "SELECT sequence FROM assignments "
+            "WHERE experiment_id = 'legacy-race' AND subject_id = 's1'"
+        ).fetchone()[0] == '["A","B"]'
+        schema_before = conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name"
+        ).fetchall()
+
+    # 已迁移库重复启动：结构与数据均不再变化
+    db.init_db()
+    with sqlite3.connect(db_path) as conn:
+        assert (
+            conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name"
+            ).fetchall()
+            == schema_before
+        )
+        assert conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0] == 1
+
+
+def test_init_db_migration_rolls_back_on_failure(tmp_path, monkeypatch) -> None:
+    """迁移中途失败：整个事务回滚，不留半迁移结构，重试可完整迁移。"""
+    db_path = tmp_path / "legacy-rollback.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE experiments (
+                id TEXT PRIMARY KEY,
+                conditions TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                group_size INTEGER NOT NULL,
+                num_subjects INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO experiments "
+            "(id, conditions, seed, group_size, num_subjects, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy-rb", '["A","B"]', 1, 2, 2, "2026-01-01T00:00:00+00:00"),
+        )
+
+    # 模拟迁移在最后一次 ALTER 之前中断（如进程被杀 / I/O 错误）：
+    # 前两列的 ALTER 已在事务内执行，必须随失败整体回滚
+    real_column_exists = db._column_exists
+
+    def _fail_before_last_alter(conn, table, column):
+        if table == "experiments" and column == "state_version":
+            raise sqlite3.OperationalError("simulated migration crash")
+        return real_column_exists(conn, table, column)
+
+    monkeypatch.setattr(db, "_column_exists", _fail_before_last_alter)
+    with pytest.raises(sqlite3.OperationalError, match="simulated migration crash"):
+        db.init_db()
+
+    # 回滚后不留半迁移结构：没有新表，experiments 仍只有旧列
+    with sqlite3.connect(db_path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert tables == {"experiments"}
+        columns = [
+            row[1] for row in conn.execute("PRAGMA table_info(experiments)")
+        ]
+        assert "washout_seconds" not in columns
+        assert "status" not in columns
+        assert "state_version" not in columns
+
+    # 重试可完整迁移，旧数据保留、缺省值生效
+    db.init_db()
+    with sqlite3.connect(db_path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert "unblindings" in tables
+        assert "enrollment_locks" in tables
+        row = conn.execute(
+            "SELECT washout_seconds, status, state_version "
+            "FROM experiments WHERE id = 'legacy-rb'"
+        ).fetchone()
+        assert tuple(row) == (0, "active", 0)
+
+
 # ---------- 实验级暂停 / 恢复 ----------
 
 def pause_experiment(

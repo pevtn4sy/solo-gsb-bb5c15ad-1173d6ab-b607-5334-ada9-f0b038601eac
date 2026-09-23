@@ -300,6 +300,10 @@ docker compose up --build
 `experiments` 表新增的 `washout_seconds`、`status`、`state_version` 列通过幂等的
 `ALTER TABLE ... DEFAULT` 补齐——**旧实验一律按 0 秒洗脱期、运行中（active）、
 状态版本 0 处理**，旧数据保留且可继续揭盲、登记完成、暂停与恢复、紧急揭盲。
+建表、缺列判断与旧列补齐在同一个 `BEGIN IMMEDIATE` 写事务内完成（检查前即持有
+写锁）：多个 API 进程同时启动迁移同一旧库时串行执行，不会重复补列导致
+duplicate column 启动失败；迁移中断整体回滚，不留半迁移结构；已迁移库重复启动
+不改变结构。
 盲态承诺不会为旧实验回填；旧实验查询承诺时返回 `409 commitments_unavailable`。
 入组互斥表是全新模块：迁移后默认没有任何受试者被占用，所有 `subject_id` 的初始
 占用状态都是 `released`，需通过 `POST /enrollment-locks` 显式登记。
@@ -1318,6 +1322,9 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
   快照与换号墓碑一律不复制，天然做到零进度继承。源实验不存在返回 `404`，
   受试者数量不成完整序列组返回与创建接口一致的 `422`。
 - **存储**（`app/db.py`，SQLite）共十七张表，启动时幂等迁移（旧库自动补齐）：
+  建表、缺列判断与旧列补齐在同一个 `BEGIN IMMEDIATE` 事务内完成，检查前即持有
+  写锁——多个 API 进程同时启动迁移同一旧库时串行执行，迁移中断整体回滚、
+  不留半迁移结构，已迁移库重复启动不改变结构：
   - `experiments`：含 `washout_seconds`、`status`（`active` / `paused`）与
     `state_version`（旧库缺列时分别 `ALTER TABLE ... DEFAULT 0 / 'active' / 0` 补齐）；
   - `assignments`：受试者完整序列（服务端持有）；
