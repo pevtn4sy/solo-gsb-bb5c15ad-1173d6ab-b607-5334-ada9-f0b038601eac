@@ -4,6 +4,9 @@
 ``experiments.db``。表结构在应用启动时通过 :func:`init_db` 创建，
 新增表均使用 ``CREATE TABLE IF NOT EXISTS``，新增列通过幂等的
 ``ALTER TABLE`` 补齐，因此已有数据库在启动时会自动迁移，无需手工介入。
+建表、缺列判断与旧列补齐在同一个 ``BEGIN IMMEDIATE`` 事务内从检查前即
+持有写锁完成：多个进程同时启动迁移同一旧库会在写锁上排队串行完成，
+迁移中断整体回滚而不会留下半迁移结构；已迁移库重复启动结构不变。
 
 表说明：
 * ``experiments`` / ``assignments``：实验与受试者的完整条件序列，
@@ -547,6 +550,36 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row["name"] == column for row in conn.execute(f"PRAGMA table_info({table})"))
 
 
+def _split_sql_script(script: str) -> list[str]:
+    """按 SQLite 的“完整语句”判定把建表脚本拆成单条语句。
+
+    ``executescript`` 会先隐式提交当前事务（破坏写锁），而建表必须留在
+    ``BEGIN IMMEDIATE`` 迁移事务内逐条执行；按分号裸拆又会被注释 / 字符串
+    中的分号误伤。这里逐行累积，借助 ``sqlite3.complete_statement`` 在
+    遇到语句结尾（行尾分号）时切出一条完整语句。
+    """
+    statements: list[str] = []
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            if pending.strip():
+                statements.append(pending)
+            pending = ""
+    if pending.strip():
+        statements.append(pending)
+    return statements
+
+
+# experiments 旧库缺列时的补齐定义：列名 -> ALTER TABLE ... ADD COLUMN 片段。
+# DEFAULT 保证旧数据行获得既有缺省值，NOT NULL 对已有行按默认值回填。
+_LEGACY_EXPERIMENT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("washout_seconds", "INTEGER NOT NULL DEFAULT 0"),
+    ("status", "TEXT NOT NULL DEFAULT 'active'"),
+    ("state_version", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
 def init_db() -> None:
     """建表 / 迁移（幂等），在应用启动时调用。
 
@@ -557,25 +590,36 @@ def init_db() -> None:
     * 旧库缺少 ``status`` / ``state_version`` 列时分别以
       ``ALTER TABLE ... DEFAULT 'active' / 0`` 补齐，
       旧实验一律按“运行中、版本 0”处理。
+
+    全部建表、缺列判断与 ``ALTER TABLE`` 都在**同一个从检查前即以
+    ``BEGIN IMMEDIATE`` 持有写锁**的事务内完成：多个进程（如多个 API
+    容器）同时启动迁移同一个旧库时会在写锁上排队，后进入事务者看到的是
+    已迁移结构而不会重复执行 ``ALTER TABLE``（不会再因 duplicate column
+    失败）；事务中断则整批回滚，不会留下只补了一半列的半迁移结构。
+    已迁移库重复启动时缺列判断全部为否，结构不发生任何变化。
     """
-    with closing(get_connection()) as conn:
-        with conn:
-            conn.executescript(SCHEMA)
-            if not _column_exists(conn, "experiments", "washout_seconds"):
-                conn.execute(
-                    "ALTER TABLE experiments "
-                    "ADD COLUMN washout_seconds INTEGER NOT NULL DEFAULT 0"
-                )
-            if not _column_exists(conn, "experiments", "status"):
-                conn.execute(
-                    "ALTER TABLE experiments "
-                    "ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
-                )
-            if not _column_exists(conn, "experiments", "state_version"):
-                conn.execute(
-                    "ALTER TABLE experiments "
-                    "ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0"
-                )
+    conn = get_connection()
+    try:
+        # 显式事务，避免 sqlite3 隐式的 deferred 事务：先取得 RESERVED 写锁，
+        # 让并发启动的建表 / 迁移在 busy_timeout 内排队串行执行
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # executescript 会先隐式提交当前事务（提前释放写锁），故拆分后
+            # 逐条执行，把全部建表留在同一个迁移事务内
+            for statement in _split_sql_script(SCHEMA):
+                conn.execute(statement)
+            for column, column_def in _LEGACY_EXPERIMENT_COLUMNS:
+                if not _column_exists(conn, "experiments", column):
+                    conn.execute(
+                        f"ALTER TABLE experiments ADD COLUMN {column} {column_def}"
+                    )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
 
 
 def _commitment_digest(

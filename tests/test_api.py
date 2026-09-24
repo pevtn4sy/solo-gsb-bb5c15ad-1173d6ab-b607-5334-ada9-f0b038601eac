@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import threading
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
@@ -2338,6 +2339,166 @@ def test_startup_migrates_legacy_database(tmp_path, monkeypatch) -> None:
         )
         assert second.status_code == 200
         assert second.json()["condition"] == "C"
+
+
+def _create_legacy_db(db_path, columns: list[str] | None = None) -> None:
+    """创建仅含旧版 experiments 表（默认无 washout / status / state_version）。"""
+    columns = columns or [
+        "id TEXT PRIMARY KEY",
+        "conditions TEXT NOT NULL",
+        "seed INTEGER NOT NULL",
+        "group_size INTEGER NOT NULL",
+        "num_subjects INTEGER NOT NULL",
+        "created_at TEXT NOT NULL",
+    ]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(f"CREATE TABLE experiments ({', '.join(columns)})")
+        conn.execute(
+            "INSERT INTO experiments "
+            "(id, conditions, seed, group_size, num_subjects, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy-1", '["A","B"]', 1, 2, 2, "2026-01-01T00:00:00+00:00"),
+        )
+
+
+def test_init_db_concurrent_startups_serialize_migration(tmp_path, monkeypatch) -> None:
+    """多个 API 进程同时启动迁移同一旧库时串行完成，无一因 duplicate column 失败。"""
+    db_path = tmp_path / "legacy-race.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+    _create_legacy_db(db_path)
+
+    workers = 6
+    barrier = threading.Barrier(workers)
+    real_get_connection = db.get_connection
+
+    def slow_connection():
+        """让每个线程在 BEGIN IMMEDIATE 处汇合，并在持锁后停留，强行制造排队。"""
+        conn = real_get_connection()
+
+        class _ConnProxy:
+            def __getattr__(self, name):
+                return getattr(conn, name)
+
+            def execute(self, sql, *args):
+                if isinstance(sql, str) and sql.startswith("BEGIN IMMEDIATE"):
+                    barrier.wait()
+                    result = conn.execute(sql, *args)
+                    time.sleep(0.2)  # 持有写锁，其余线程在此排队
+                    return result
+                return conn.execute(sql, *args)
+
+        return _ConnProxy()
+
+    monkeypatch.setattr(db, "get_connection", slow_connection)
+
+    failures: list[BaseException] = []
+
+    def migrate() -> None:
+        try:
+            db.init_db()
+        except BaseException as exc:  # 捕获后在主线程断言，避免线程内静默
+            failures.append(exc)
+
+    threads = [threading.Thread(target=migrate) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert failures == []
+
+    with sqlite3.connect(db_path) as conn:
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(experiments)")]
+        assert columns == [
+            "id",
+            "conditions",
+            "seed",
+            "group_size",
+            "num_subjects",
+            "created_at",
+            "washout_seconds",
+            "status",
+            "state_version",
+        ]
+        # 旧数据保留，旧库缺省值正确回填
+        assert conn.execute(
+            "SELECT washout_seconds, status, state_version "
+            "FROM experiments WHERE id = 'legacy-1'"
+        ).fetchone() == (0, "active", 0)
+
+
+def test_init_db_failed_migration_leaves_no_half_migrated_schema(
+    tmp_path, monkeypatch
+) -> None:
+    """迁移事务中途失败时整体回滚：不留下只补了部分列 / 表的半迁移结构。"""
+    db_path = tmp_path / "legacy-rollback.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+    _create_legacy_db(db_path)
+
+    real_column_exists = db._column_exists
+
+    def failing_check(conn, table, column):
+        # washout / status 的 ALTER 已随事务发出后，在最后一列检查处模拟中断
+        if table == "experiments" and column == "state_version":
+            raise RuntimeError("simulated migration interruption")
+        return real_column_exists(conn, table, column)
+
+    monkeypatch.setattr(db, "_column_exists", failing_check)
+    with pytest.raises(RuntimeError, match="simulated migration interruption"):
+        db.init_db()
+
+    with sqlite3.connect(db_path) as conn:
+        # 已执行的 ALTER / CREATE TABLE 全部随事务回滚，旧库结构原样保留
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(experiments)")]
+        assert columns == [
+            "id",
+            "conditions",
+            "seed",
+            "group_size",
+            "num_subjects",
+            "created_at",
+        ]
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='enrollment_locks'"
+        ).fetchone() is None
+        assert conn.execute("SELECT seed FROM experiments").fetchone() == (1,)
+
+    monkeypatch.setattr(db, "_column_exists", real_column_exists)
+    # 中断后再次启动：旧库仍可完整迁移成功
+    db.init_db()
+    with sqlite3.connect(db_path) as conn:
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(experiments)")]
+        assert columns[-3:] == ["washout_seconds", "status", "state_version"]
+        assert conn.execute(
+            "SELECT washout_seconds, status, state_version FROM experiments"
+        ).fetchone() == (0, "active", 0)
+
+
+def test_init_db_repeat_startup_does_not_change_schema(tmp_path, monkeypatch) -> None:
+    """已迁移库重复启动不改变任何结构（建表 SQL 与列定义均保持一致）。"""
+    db_path = tmp_path / "legacy-idempotent.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+    _create_legacy_db(db_path)
+
+    db.init_db()
+    with sqlite3.connect(db_path) as conn:
+        schema_before = conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name"
+        ).fetchall()
+        columns_before = conn.execute("PRAGMA table_info(experiments)").fetchall()
+
+    for _ in range(3):
+        db.init_db()
+
+    with sqlite3.connect(db_path) as conn:
+        schema_after = conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name"
+        ).fetchall()
+        columns_after = conn.execute("PRAGMA table_info(experiments)").fetchall()
+
+    assert schema_after == schema_before
+    assert columns_after == columns_before
 
 
 # ---------- 实验级暂停 / 恢复 ----------

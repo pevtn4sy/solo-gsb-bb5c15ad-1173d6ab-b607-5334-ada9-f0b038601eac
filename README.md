@@ -300,6 +300,12 @@ docker compose up --build
 `experiments` 表新增的 `washout_seconds`、`status`、`state_version` 列通过幂等的
 `ALTER TABLE ... DEFAULT` 补齐——**旧实验一律按 0 秒洗脱期、运行中（active）、
 状态版本 0 处理**，旧数据保留且可继续揭盲、登记完成、暂停与恢复、紧急揭盲。
+建表、缺列判断与旧列补齐在**同一个 `BEGIN IMMEDIATE` 事务**内完成，并在执行任何
+检查前即取得 SQLite 写锁：即使多个 API 进程（或多个容器 / 副本）同时启动并迁移
+同一个旧库，也会在写锁上排队**串行完成**，后进入事务者看到的是已迁移结构，不会
+因 `duplicate column` 启动失败；迁移事务一旦中断则整体回滚，**不会留下只补了一半
+列 / 表的半迁移结构**；已是最新结构的库重复启动时缺列判断全部为否，结构不发生任何
+变化。
 盲态承诺不会为旧实验回填；旧实验查询承诺时返回 `409 commitments_unavailable`。
 入组互斥表是全新模块：迁移后默认没有任何受试者被占用，所有 `subject_id` 的初始
 占用状态都是 `released`，需通过 `POST /enrollment-locks` 显式登记。
@@ -1317,7 +1323,12 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
   三张初始表，源实验的进度、揭盲、完成、幂等记录、暂停 / 恢复、紧急揭盲、
   快照与换号墓碑一律不复制，天然做到零进度继承。源实验不存在返回 `404`，
   受试者数量不成完整序列组返回与创建接口一致的 `422`。
-- **存储**（`app/db.py`，SQLite）共十七张表，启动时幂等迁移（旧库自动补齐）：
+- **存储**（`app/db.py`，SQLite）共十七张表，启动时幂等迁移（旧库自动补齐）。
+  建表、缺列判断与旧列补齐在**单个 `BEGIN IMMEDIATE` 事务**内、于任何检查前先持有
+  写锁完成（`executescript` 会隐式提交并提前释放写锁，故建表脚本按
+  `sqlite3.complete_statement` 拆成单条语句逐条执行，而非一次性 `executescript`）：
+  多个进程同时启动迁移同一旧库会在写锁上排队串行完成、无 duplicate column 失败，
+  迁移中断整体回滚不留半迁移结构，已迁移库重复启动结构不变。
   - `experiments`：含 `washout_seconds`、`status`（`active` / `paused`）与
     `state_version`（旧库缺列时分别 `ALTER TABLE ... DEFAULT 0 / 'active' / 0` 补齐）；
   - `assignments`：受试者完整序列（服务端持有）；
